@@ -5,6 +5,10 @@ A service that monitors Kubernetes resources and records their states in Redis.
 Watches: Namespaces, Deployments (ContainerApps), Secrets, and PVCs (Volumes).
 """
 
+from collections import deque
+from dataclasses import dataclass
+from typing import Literal
+
 import os
 import sys
 import json
@@ -60,6 +64,22 @@ logger = logging.getLogger('state-monitor')
 watches = []
 stop_event = threading.Event()
 redis_client = None
+redis_available = True
+
+QUEUE_FLUSH_INTERVAL = 5  # sec
+
+
+@dataclass
+class QueuedOperation:
+    op_type: Literal['store', 'delete']
+    resource_type: str
+    resource_id: str
+    nsid: str | None
+    state: dict | None  # None for delete operations
+
+
+pending_operations: deque[QueuedOperation] = deque()
+pending_lock = threading.Lock()
 
 NAMESPACE_PREFIX_LEN = len(NAMESPACE_PREFIX)
 SECRET_PREFIX_LEN = len(SECRET_PREFIX)
@@ -198,10 +218,30 @@ def get_hash_key(resource_type: str, nsid: str | None) -> str:
     return f"{KEY_PREFIX}:{nsid}:{resource_type}s"
 
 
+def queue_operation(op: QueuedOperation):
+    """
+    Add operation to the pending queue.
+    """
+    with pending_lock:
+        # Remove any existing operation for the same resource
+        key = (op.resource_type, op.resource_id, op.nsid)
+        filtered = [
+            p for p in pending_operations if (p.resource_type, p.resource_id, p.nsid) != key
+        ]
+        pending_operations.clear()
+        pending_operations.extend(filtered)
+        pending_operations.append(op)
+        logger.debug(
+            f"Queued {op.op_type} for {op.resource_type}/{op.resource_id} (queue size: {len(pending_operations)})"
+        )
+
+
 def store_state(resource_type: str, resource_id: str, nsid: str | None, state: dict):
     """
-    Store resource state in Redis hash.
+    Store resource state in Redis hash. Queues operation if Redis is unavailable.
     """
+    global redis_available
+
     if not redis_client or not resource_id:
         return
 
@@ -214,16 +254,27 @@ def store_state(resource_type: str, resource_id: str, nsid: str | None, state: d
 
     try:
         redis_client.hset(hash_key, resource_id, json.dumps(state_data))
+        redis_available = True
         logger.debug(f"Stored state for {resource_type}/{resource_id}: {state.get('status')}")
 
     except redis.RedisError as e:
-        logger.error(f"Failed to store state in Redis: {e}")
+        logger.warning(f"Redis unavailable, queueing store for {resource_type}/{resource_id}: {e}")
+        redis_available = False
+        queue_operation(QueuedOperation(
+            op_type='store',
+            resource_type=resource_type,
+            resource_id=resource_id,
+            nsid=nsid,
+            state=state,
+        ))
 
 
 def delete_state(resource_type: str, resource_id: str, nsid: str | None):
     """
-    Delete resource state from Redis hash.
+    Delete resource state from Redis hash. Queues operation if Redis is unavailable.
     """
+    global redis_available
+
     if not redis_client or not resource_id:
         return
 
@@ -231,10 +282,19 @@ def delete_state(resource_type: str, resource_id: str, nsid: str | None):
 
     try:
         redis_client.hdel(hash_key, resource_id)
+        redis_available = True
         logger.debug(f"Deleted state for {resource_type}/{resource_id}")
 
     except redis.RedisError as e:
-        logger.error(f"Failed to delete state from Redis: {e}")
+        logger.warning(f"Redis unavailable, queueing delete for {resource_type}/{resource_id}: {e}")
+        redis_available = False
+        queue_operation(QueuedOperation(
+            op_type='delete',
+            resource_type=resource_type,
+            resource_id=resource_id,
+            nsid=nsid,
+            state=None,
+        ))
 
 
 def update_health_status(healthy: bool, message: str = ""):
@@ -259,6 +319,62 @@ def update_health_status(healthy: bool, message: str = ""):
         logger.error(f"Failed to update health status: {e}")
 
 
+def flush_pending_operations():
+    """
+    Background thread that periodically attempts to flush queued operations to Redis.
+    """
+    global redis_available
+
+    while not stop_event.is_set():
+        stop_event.wait(QUEUE_FLUSH_INTERVAL)
+
+        if stop_event.is_set():
+            break
+
+        with pending_lock:
+            if not pending_operations:
+                continue
+            # Take a snapshot of operations to process
+            ops_to_process = list(pending_operations)
+
+        if not ops_to_process:
+            continue
+
+        logger.info(f"Attempting to flush {len(ops_to_process)} queued operations to Redis")
+
+        success_count = 0
+        for op in ops_to_process:
+            try:
+                hash_key = get_hash_key(op.resource_type, op.nsid)
+
+                if op.op_type == 'store' and op.state is not None:
+                    state_data = {
+                        **op.state,
+                        'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    }
+                    redis_client.hset(hash_key, op.resource_id, json.dumps(state_data))
+
+                elif op.op_type == 'delete':
+                    redis_client.hdel(hash_key, op.resource_id)
+
+                # Remove from queue on success
+                with pending_lock:
+                    try:
+                        pending_operations.remove(op)
+                    except ValueError:
+                        pass  # Already removed by a newer operation
+                success_count += 1
+
+            except redis.RedisError as e:
+                logger.warning(f"Still unable to reach Redis: {e}")
+                redis_available = False
+                break  # Stop trying, will retry next interval
+
+        if success_count > 0:
+            redis_available = True
+            logger.info(f"Flushed {success_count} queued operations to Redis")
+
+
 def health_check_loop(api_client: kubernetes.client.ApiClient):
     """
     Continuously check K8s API health using /readyz endpoint and update Redis.
@@ -272,6 +388,7 @@ def health_check_loop(api_client: kubernetes.client.ApiClient):
                 _preload_content=False
             )
             status_code = response.status
+
             if status_code == 200:
                 update_health_status(True, "K8s API is ready")
             else:
@@ -490,14 +607,13 @@ def main():
         threading.Thread(target=watch_secrets, args=(core_v1,), name="secret-watcher"),
         threading.Thread(target=watch_pvcs, args=(core_v1,), name="pvc-watcher"),
         threading.Thread(target=health_check_loop, args=(api_client,), name="health-checker"),
+        threading.Thread(target=flush_pending_operations, name="queue-flusher"),
     ]
 
     for t in threads:
         t.daemon = True
         t.start()
         logger.info(f"Started thread: {t.name}")
-
-    logger.info("All watchers started")
 
     # Keep main thread alive
     for t in threads:
