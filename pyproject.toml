@@ -1,0 +1,9 @@
+[project]
+name = "kargo-state-monitor"
+version = "0.1.0"
+description = "Kargo State Monitor - monitors K8s resources and records state in Redis"
+requires-python = "==3.13.*"
+dependencies = [
+    "kubernetes==35.0.0",
+    "redis==7.1.0",
+]
