@@ -83,17 +83,17 @@ spec:
               value: "INFO"
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 200m
+              memory: 256Mi
             limits:
               cpu: 200m
               memory: 256Mi
           livenessProbe:
             exec:
               command:
-                - python
+                - /bin/sh
                 - -c
-                - "import redis; r = redis.from_url('${REDIS_URL}'); r.ping()"
+                - "python -c \"import os, redis; r = redis.from_url(os.environ['REDIS_URL']); r.ping()\""
             initialDelaySeconds: 10
             periodSeconds: 30
       volumes:
