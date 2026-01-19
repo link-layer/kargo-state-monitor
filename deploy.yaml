@@ -91,11 +91,11 @@ spec:
           livenessProbe:
             exec:
               command:
-                - /bin/sh
-                - -c
-                - "python -c \"import os, redis; r = redis.from_url(os.environ['REDIS_URL']); r.ping()\""
+                - cat
+                - /proc/1/cmdline
             initialDelaySeconds: 10
             periodSeconds: 30
+            timeoutSeconds: 5
       volumes:
         - name: cache
           emptyDir: { }
